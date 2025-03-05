@@ -62,7 +62,7 @@ func main() {
 	*/
 	s.AddTool(mcp.Tool{
 		Name:        "go_doc",
-		Description: toolDescription,
+		Description: goDocToolDescription,
 		InputSchema: mcp.ToolInputSchema{
 			Type: "object",
 			Properties: map[string]interface{}{
@@ -126,23 +126,12 @@ func main() {
 	godocServer.cleanup()
 }
 
-const toolDescription = `Get Go documentation for a package, type, function, or method.
+const goDocToolDescription = `Get Go documentation for a package, type, function, or method.
 This is the preferred and most efficient way to understand Go packages, providing official package
 documentation in a concise format. Use this before attempting to read source files directly. Results
 are cached and optimized for AI consumption.
-
-Best Practices:
-1. ALWAYS try this tool first before reading package source code
-2. Start with basic package documentation before looking at source code or specific symbols
-3. Use -all flag when you need comprehensive package documentation
-4. Only look up specific symbols after understanding the package overview
-
-Common Usage Patterns:
-- Standard library: Use just the package name (e.g., "io", "net/http")
-- External packages: Use full import path (e.g., "github.com/user/repo")
-- Local packages: Use relative path (e.g., "./pkg") or absolute path
-
-The documentation is cached for 5 minutes to improve performance.`
+The arguments are just like the 'go doc' command, with the package or symbol as the first argument.
+`
 
 type GodocServer struct {
 	Workdir string
@@ -157,12 +146,6 @@ type cachedDoc struct {
 }
 
 // createTempProject creates a temporary Go project with the given package
-
-// isStdLib checks if a package is part of the Go standard library
-func isStdLib(pkg string) bool {
-	// Standard library packages don't contain a dot in their import path
-	return !strings.Contains(pkg, ".")
-}
 
 // cleanup removes all temporary directories
 func (s *GodocServer) cleanup() {
@@ -214,6 +197,10 @@ func (s *GodocServer) runGoDoc(workingDir string, args ...string) (string, error
 		return "", fmt.Errorf("go doc error: %v\noutput: %s\nTip: Use -h flag to see all available options", err, errStr)
 	}
 
+	if len(out) == 0 {
+		return "", fmt.Errorf("No documentation found by running the command: go doc %s from the directory: %s", strings.Join(args, " "), workingDir)
+	}
+
 	content := string(out)
 	s.cache[cacheKey] = cachedDoc{
 		content:   content,
@@ -226,43 +213,52 @@ func (s *GodocServer) runGoDoc(workingDir string, args ...string) (string, error
 }
 
 // handleGoDoc implements the tools/call endpoint
-func (s *GodocServer) handleGoDoc(arguments map[string]interface{}) (*mcp.CallToolResult, error) {
+func (s *GodocServer) handleGoDoc(arguments map[string]interface{}) (result *mcp.CallToolResult, err error) {
+
+	// Recover from any panics and return as error
+	defer func() {
+		if r := recover(); r != nil {
+
+			result = &mcp.CallToolResult{
+				IsError: true,
+				Content: []interface{}{
+					map[string]interface{}{
+						"type": "text",
+						"text": fmt.Sprintf("Error: %v", r),
+					},
+				},
+			}
+			log.Printf("Recovered from panic: %v", r)
+		}
+	}()
+
 	log.Printf("handleToolCall called with arguments: %+v", arguments)
 
 	// Use the reso
 	// Build command arguments
 	var cmdArgs []string
 
-	var pkgSymMethodOrField string
-	if tmp, ok := arguments["pkgSymMethodOrField"]; ok {
-		pkgSymMethodOrField, ok = tmp.(string)
-		if !ok {
-			return nil, fmt.Errorf("pkgSymMethodOrField must be a string")
-		}
-		cmdArgs = append(cmdArgs, pkgSymMethodOrField)
+	// Add any provided command flags
+	if tmp, ok := getMapSliceAnyString(arguments, "cmd_flags"); ok && len(tmp) > 0 {
+		cmdArgs = append(cmdArgs, tmp...)
 	}
 
-	// Add any provided command flags
-	if flags, ok := arguments["cmd_flags"].([]interface{}); ok {
-		for _, flag := range flags {
-			if flagStr, ok := flag.(string); ok {
-				cmdArgs = append(cmdArgs, flagStr)
-			}
-		}
+	if pkgSymMethodOrField, ok := getString(arguments, "pkgSymMethodOrField"); ok && pkgSymMethodOrField != "" {
+		cmdArgs = append(cmdArgs, pkgSymMethodOrField)
 	}
 
 	// Run go doc command with working directory
 	doc, err := s.runGoDoc(s.Workdir, cmdArgs...)
 	if err != nil {
-		log.Printf("Error running go doc: %v", err)
-		return nil, err
+		return errResponse(err)
 	}
 
-	// Calculate byte size
-	byteSize := len(doc)
+	if doc == "" {
+		doc = "No documentation found by go-mcp"
+	}
 
 	// Create the result with just the documentation
-	result := &mcp.CallToolResult{
+	result = &mcp.CallToolResult{
 		Content: []interface{}{
 			map[string]interface{}{
 				"type": "text",
@@ -271,7 +267,6 @@ func (s *GodocServer) handleGoDoc(arguments map[string]interface{}) (*mcp.CallTo
 		},
 	}
 
-	log.Printf("Returning result (%d bytes)", byteSize)
 	return result, nil
 }
 
@@ -360,4 +355,19 @@ func getString(m map[string]interface{}, key string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+func errResponse(err error) (*mcp.CallToolResult, error) {
+	if err == nil {
+		return nil, nil
+	}
+	return &mcp.CallToolResult{
+		Content: []interface{}{
+			map[string]interface{}{
+				"type": "text",
+				"text": fmt.Sprintf("Error: %v", err),
+			},
+		},
+		IsError: true,
+	}, nil
 }
